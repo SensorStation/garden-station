@@ -1,7 +1,8 @@
 const clientId = 'mqttjs_' + Math.random().toString(16).substr(2, 8);
 
-const host = "ws://10.11.1.11:8080";
-console.log(host);
+// Derive the broker WebSocket address from the page host so this works on any device.
+const host = `ws://${window.location.hostname}:8080`;
+console.log('MQTT broker:', host);
 
 const options = {
     keepalive: 60,
@@ -33,95 +34,53 @@ client.on('reconnect', () => {
 
 client.on('connect', () => {
     console.log(`Client connected: ${clientId}`);
-    console.log("subscribing to ss/c/+/env");
-    client.subscribe('ss/d/+/env', (err) => {
-        if (err) {
-            console.log("subscribe error: ", err)
-            return;
-        }
+    client.subscribe('gardener/devices/env/state', (err) => {
+        if (err) { console.log("subscribe error: ", err); }
     });
-    client.subscribe('ss/d/+/soil', (err) => {
-        if (err) {
-            console.log("subscribe error: ", err)
-            return;
-        }
+    client.subscribe('gardener/devices/soil/state', (err) => {
+        if (err) { console.log("subscribe error: ", err); }
     });
-    client.subscribe('ss/d/+/hello', (err) => {
-        if (err) {
-            console.log("subscribe error: ", err)
-            return;
-        }
-    });
-    client.subscribe('ss/c/+/pump', (err) => {
-        if (err) {
-            console.log("subscribe error: ", err)
-            return;
-        }
-    });
-    client.subscribe('ss/e/+', (err) => {
-        if (err) {
-            console.log("subscribe error: ", err)
-            return;
-        }
+    client.subscribe('gardener/devices/pump/state', (err) => {
+        if (err) { console.log("subscribe error: ", err); }
     });
 })
 
 client.on('message', (topic, message) => {
-    const parts = topic.split('/');
-    const lastPart = parts.pop();
     console.log(topic, " => ", message.toString());
 
+    const lastPart = topic.split('/').pop();
+
     switch (lastPart) {
-    case "env":
-        var msg = JSON.parse(message);
-        document.getElementById("temperature").innerHTML = msg.temperature;
-        document.getElementById("pressure").innerHTML = msg.pressure;
-        document.getElementById("humidity").innerHTML = msg.humidity;
+    case "state": {
+        const deviceName = topic.split('/')[2];
+        switch (deviceName) {
+        case "env": {
+            const msg = JSON.parse(message);
+            document.getElementById("temperature").innerHTML = msg.temperature;
+            document.getElementById("pressure").innerHTML = msg.pressure;
+            document.getElementById("humidity").innerHTML = msg.humidity;
+            break;
+        }
+        case "soil":
+            document.getElementById("soil").innerHTML = message.toString();
+            break;
+        case "pump":
+            document.getElementById("pump").innerHTML = message.toString();
+            break;
+        }
         break;
-
-    case "soil":
-        document.getElementById("soil").innerHTML = message.toString();
-        break;
-
-    case "pump":
-        document.getElementById("pump").innerHTML = message.toString();
-        break;
-
-    case "hello":
-        var msg = JSON.parse(message)
-        document.getElementById("stationId").innerHTML = msg.id;
-	document.getElementById("hostname").innerHTML = msg.hostname;
-
-	const ifaces = msg.iface;
-	const ifacesEle = document.getElementById("ifaces");
-	ifacesEle.replaceChildren();
-	ifaces.forEach(function(iface) {
-	    const ifaceEle = document.createElement('div');
-	    iface.IPAddrs.forEach(function(ipaddr) {
-		const ipele = document.createElement('span');
-		ipele.classList.add("text-start");
-		ipele.innerHTML = ipaddr + ' ';
-		ifaceEle.appendChild(ipele);
-	    });
-	    const macele = document.createElement('span');
-	    macele.innerHTML = iface.MACAddr + ' ';
-	    macele.classList.add('w-50');
-	    macele.classList.add('text-end');
-	    ifaceEle.appendChild(macele);
-	    ifacesEle.appendChild(ifaceEle);
-	});
     }
-
+    }
 });
 
 function On() {
     console.log("on")
-    client.publish('ss/c/station/pump', "on", { qos: 0, retain: false })    
+    client.publish('gardener/devices/pump/set', JSON.stringify(true), { qos: 0, retain: false })
 }
 
 function Off() {
     console.log("off")
-    client.publish('ss/c/station/pump', "off", { qos: 0, retain: false })    
+    client.publish('gardener/devices/pump/set', JSON.stringify(false), { qos: 0, retain: false })
 }
 
 document.getElementById("on").addEventListener('click', On);

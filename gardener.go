@@ -1,227 +1,299 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/rustyeddy/devices"
-	"github.com/rustyeddy/devices/bme280"
-	"github.com/rustyeddy/devices/button"
-	"github.com/rustyeddy/devices/oled"
-	"github.com/rustyeddy/devices/relay"
-	"github.com/rustyeddy/devices/vh400"
+	bme280dev "github.com/rustyeddy/devices/devices/bme280"
+	"github.com/rustyeddy/devices/devices/button"
+	"github.com/rustyeddy/devices/devices/relay"
+	"github.com/rustyeddy/devices/devices/vh400"
+	"github.com/rustyeddy/devices/display"
+	"github.com/rustyeddy/devices/drivers"
+	"github.com/rustyeddy/devices/mock"
 	"github.com/rustyeddy/otto/messenger"
-	"github.com/rustyeddy/otto/server"
-	"github.com/rustyeddy/otto/station"
+	mqttclient "github.com/rustyeddy/otto/messenger/mqtt"
 )
+
+var pinmap = map[string]int{
+	"on":   17,
+	"off":  27,
+	"pump": 5,
+}
 
 type Gardener struct {
-	*messenger.Messenger
-	*station.StationManager
-	*server.Server
-	*station.DeviceManager // is this really needed?
+	soil      devices.Source[float64]
+	env       devices.Source[bme280dev.Env]
+	pump      *relay.Relay
+	buttonOn  *button.Button
+	buttonOff *button.Button
+	display   *display.OLED
 
-	soil    *vh400.VH400
-	env     *bme280.BME280
-	pump    *relay.Relay
-	on      *button.Button
-	off     *button.Button
-	display *oled.OLED
+	mqttClient *mqttclient.Paho
+	registry   *messenger.Registry
+	topics     messenger.TopicScheme
 
-	Done chan any
+	ctrl *Controller
 }
 
-func (g *Gardener) GetDeviceManager() *station.DeviceManager {
-	if g.DeviceManager == nil {
-		g.DeviceManager = station.NewDeviceManager()
-	}
-	return g.DeviceManager
-}
-
-var (
-	pinmap = map[string]int{
-		"on":   17,
-		"off":  27,
-		"soil": 22,
-		"pump": 5,
-		"env":  6,
-	}
-)
-
-func (g *Gardener) Init() {
-	g.Messenger = messenger.GetMessenger()
-	g.DeviceManager = g.GetDeviceManager()
-	g.StationManager = station.NewStationManager()
-	g.Server = server.GetServer()
-	g.Done = make(chan any)
-
-	g.initButtons()
-	g.initPump()
-	g.initEnv()
-	g.initDisplay()
-	g.InitSoil()
-}
-
-func (g *Gardener) initButtons() {
-	var err error
-	g.on, err = button.New("on", pinmap["on"])
-	if err != nil {
-		panic(err)
-	}
-	g.DeviceManager.Add(g.on)
-	g.on.RegisterEventHandler(func(evt *devices.DeviceEvent) {
-		switch evt.Type {
-		case devices.DeviceEventRisingEdge:
-			slog.Info("button pressed", "button", "on", "action", "pump_on")
-			g.Messenger.Pub("d/on", []byte("on"))
-		}
-	})
-
-	g.off, err = button.New("off", pinmap["off"])
-	if err != nil {
-		panic(err)
-	}
-	g.DeviceManager.Add(g.off)
-	g.off.RegisterEventHandler(func(evt *devices.DeviceEvent) {
-		switch evt.Type {
-		case devices.DeviceEventRisingEdge:
-			slog.Info("button pressed", "button", "off", "action", "pump_off")
-			g.Messenger.Pub("d/off", []byte("off"))
-		}
-	})
-}
-
-func (g *Gardener) InitSoil() {
-	var err error
-	g.soil, err = vh400.New("soil", pinmap["soil"])
-	if err != nil {
-		panic(err)
-	}
-	g.DeviceManager.Add(g.soil)
-	cb := func(t time.Time) {
-		value, err := g.soil.Get()
-		if err != nil {
-			slog.Error("soil sensor read failed", "error", err)
-			return
-		}
-		slog.Info("soil moisture reading", "value", value)
-		g.Messenger.Pub("d/soil", []byte(fmt.Sprintf("%5.2f", value)))
-	}
-	g.soil.StartTicker(10*time.Second, &cb)
-}
-
-func (g *Gardener) initEnv() {
-	var err error
-	g.env, err = bme280.New("env", "/dev/i2c-1", 0x76)
-	if err != nil {
-		panic(err)
-	}
-	g.DeviceManager.Add(g.env)
-	ticker := func(t time.Time) {
-		resp, err := g.env.Get()
-		if err != nil {
-			slog.Error("env sensor read failed", "error", err)
-			return
-		}
-		slog.Info("env sensor reading",
-			"temperature", resp.Temperature,
-			"humidity", resp.Humidity,
-			"pressure", resp.Pressure)
-
-		jbuf, err := resp.JSON()
-		if err != nil {
-			slog.Error("env sensor marshal failed", "error", err)
-			return
-		}
-		slog.Info("env sensor json", "data", string(jbuf))
-		g.Messenger.Pub("d/env", jbuf)
-	}
-	g.env.StartTicker(10*time.Second, &ticker)
-}
-
-func (g *Gardener) initPump() {
-	var err error
-	g.pump, err = relay.New("pump", pinmap["pump"])
-	if err != nil {
-		panic(err)
-	}
-	g.Messenger.Sub("c/pump", g.pump.HandleMsg)
-}
-
-func (g *Gardener) initDisplay() {
-	display, err := oled.New("c/lcd", 0x27, 1)
-	if err != nil {
-		panic(err)
-	}
-	display.Clear()
-
-	// Register devices
-	g.DeviceManager.Add(display)
-}
-
-func (g *Gardener) Start() {
-	err := g.Messenger.Connect()
-	if err != nil {
-		slog.Error("gardener failed to connect to broker ", "error", err)
-		return
+// Init creates all devices and wires MQTT subscriptions.
+// Pass a non-nil mqttPaho to enable MQTT; pass nil to run in local-only mode.
+func (g *Gardener) Init(ctx context.Context, mqttPaho *mqttclient.Paho) error {
+	g.topics = messenger.TopicScheme{Prefix: "gardener"}
+	g.ctrl = &Controller{
+		dry: config.DryThreshold,
+		wet: config.WetThreshold,
 	}
 
-	topics := []string{"soil", "env", "on", "off", "pump", "display"}
-	for _, topic := range topics {
-		g.Sub(topic, g.MsgHandler)
-	}
+	gpioFactory := newGPIOFactory(config.Mock)
+	oledFactory := newOLEDFactory(config.Mock)
+
 	if config.Mock {
-		md := g.DeviceManager.GetDevice("soil")
-		soil := md.(*vh400.VH400)
-		g.emulator(soil)
+		g.soil = mock.NewSensor(mock.SensorConfig[float64]{
+			Name:        "soil",
+			Interval:    10 * time.Second,
+			Initial:     25.0,
+			EmitInitial: true,
+			Next: func(v float64) float64 {
+				v -= 0.5
+				if v < 10 {
+					return 70.0
+				}
+				return v
+			},
+		})
+		g.env = mock.NewSensor(mock.SensorConfig[bme280dev.Env]{
+			Name:        "env",
+			Interval:    10 * time.Second,
+			Initial:     bme280dev.Env{Temperature: 22.0, Humidity: 55.0, Pressure: 101325.0},
+			EmitInitial: true,
+		})
+	} else {
+		g.soil = vh400.NewVH400(vh400.VH400Config{
+			Name:        "soil",
+			Factory:     drivers.PeriphADCFactory{},
+			Bus:         "/dev/i2c-1",
+			Addr:        0x48,
+			Channel:     0,
+			Interval:    10 * time.Second,
+			EmitInitial: true,
+		})
+		g.env = bme280dev.New(bme280dev.Config{
+			Name:        "env",
+			Bus:         "/dev/i2c-1",
+			Addr:        0x76,
+			Interval:    10 * time.Second,
+			EmitInitial: true,
+		})
 	}
 
-}
+	g.pump = relay.New(relay.RelayConfig{
+		Name:    "pump",
+		Factory: gpioFactory,
+		Chip:    "gpiochip0",
+		Offset:  pinmap["pump"],
+	})
+	g.buttonOn = button.NewButton(button.ButtonConfig{
+		Name:    "on",
+		Factory: gpioFactory,
+		Chip:    "gpiochip0",
+		Offset:  pinmap["on"],
+		Edge:    drivers.EdgeBoth,
+		Bias:    drivers.BiasPullUp,
+	})
+	g.buttonOff = button.NewButton(button.ButtonConfig{
+		Name:    "off",
+		Factory: gpioFactory,
+		Chip:    "gpiochip0",
+		Offset:  pinmap["off"],
+		Edge:    drivers.EdgeBoth,
+		Bias:    drivers.BiasPullUp,
+	})
+	g.display = display.NewOLED(display.OLEDConfig{
+		Name:    "display",
+		Factory: oledFactory,
+		Bus:     "1",
+		Addr:    0x27,
+		Width:   128,
+		Height:  64,
+	})
 
-func (g *Gardener) MsgHandler(msg *messenger.Msg) error {
-	slog.Info("MQTT [I]", "topic", msg.Topic, "value", msg.Data)
+	if mqttPaho != nil {
+		g.mqttClient = mqttPaho
+		g.registry = messenger.NewRegistry(mqttPaho, g.topics)
 
-	switch msg.Topic {
-	case "soil":
-		fmt.Println("Got soil: ")
+		// Subscribe to pump set commands from MQTT.
+		pumpSetTopic := g.topics.Set("pump")
+		g.registry.WantSub(pumpSetTopic, 1, func(m messenger.Message) {
+			var on bool
+			if err := json.Unmarshal(m.Payload, &on); err != nil {
+				slog.Error("pump command parse failed", "payload", string(m.Payload), "error", err)
+				return
+			}
+			select {
+			case g.pump.In() <- on:
+			default:
+				slog.Warn("pump command dropped; buffer full")
+			}
+		})
 
-	case "env":
-		fmt.Println("Got env: ")
+		// ResubscribeAll is called automatically by SetOnConnect on every connect/reconnect.
+		mqttPaho.SetOnConnect(func() {
+			g.registry.ResubscribeAll(ctx)
+		})
 
-	case "on", "off":
-		fmt.Println("Got a button")
-
-	default:
-		slog.Error("unknown msg type", "topic", msg.Topic, "msg", msg)
+		if err := mqttPaho.Connect(ctx); err != nil {
+			slog.Warn("MQTT connect failed; running without broker", "error", err)
+			g.registry = nil
+			g.mqttClient = nil
+		}
 	}
-	fmt.Printf("msg: %#v\n", msg)
+
 	return nil
 }
 
-func (g *Gardener) Stop() {
-	// Implement stop logic if needed
-	g.Done <- true
+// Run starts all device goroutines and blocks until ctx is cancelled.
+func (g *Gardener) Run(ctx context.Context) error {
+	g.InitApp()
+
+	var wg sync.WaitGroup
+
+	devList := []devices.Device{g.soil, g.env, g.pump, g.buttonOn, g.buttonOff, g.display}
+	for _, d := range devList {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := d.Run(ctx); err != nil {
+				slog.Error("device stopped", "device", d.Name(), "error", err)
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		g.drainSoil(ctx)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		g.drainEnv(ctx)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		g.watchButtons(ctx)
+	}()
+
+	wg.Wait()
+	return nil
 }
 
-func (g *Gardener) emulator(soil *vh400.VH400) {
-	ticker := time.NewTicker(5 * time.Second)
-
-	go func() {
-		for {
-			select {
-			case <-g.Done:
-				return // Exit the goroutine when done signal is received
-			case _ = <-ticker.C:
-				// Execute this code at each tick
-				v, err := soil.Pin.Get()
-				if err != nil {
-					slog.Error("emulator failure", "error", err)
-					continue
-				}
-				v += 0.02
-				soil.Pin.Set(v)
+func (g *Gardener) drainSoil(ctx context.Context) {
+	for {
+		select {
+		case v, ok := <-g.soil.Out():
+			if !ok {
+				return
 			}
+			slog.Info("soil moisture", "value", fmt.Sprintf("%.2f%%", v))
+			g.publish(ctx, g.topics.State("soil"), v)
+			g.updateDisplay(fmt.Sprintf("soil: %.1f%%", v))
+			g.ctrl.handle(ctx, v, g.pump)
+		case <-ctx.Done():
+			return
 		}
-	}()
+	}
+}
+
+func (g *Gardener) drainEnv(ctx context.Context) {
+	for {
+		select {
+		case v, ok := <-g.env.Out():
+			if !ok {
+				return
+			}
+			slog.Info("env reading",
+				"temperature", fmt.Sprintf("%.1f°C", v.Temperature),
+				"humidity", fmt.Sprintf("%.1f%%", v.Humidity),
+				"pressure", fmt.Sprintf("%.0fPa", v.Pressure),
+			)
+			g.publish(ctx, g.topics.State("env"), v)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// watchButtons forwards physical button presses to the pump.
+// With BiasPullUp: line LOW (false) means button pressed.
+func (g *Gardener) watchButtons(ctx context.Context) {
+	for {
+		select {
+		case state, ok := <-g.buttonOn.Out():
+			if !ok {
+				return
+			}
+			if !state {
+				slog.Info("on button pressed; starting pump")
+				select {
+				case g.pump.In() <- true:
+				default:
+				}
+			}
+		case state, ok := <-g.buttonOff.Out():
+			if !ok {
+				return
+			}
+			if !state {
+				slog.Info("off button pressed; stopping pump")
+				select {
+				case g.pump.In() <- false:
+				default:
+				}
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (g *Gardener) publish(ctx context.Context, topic string, v any) {
+	if g.mqttClient == nil {
+		return
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		slog.Error("marshal failed", "topic", topic, "error", err)
+		return
+	}
+	if err := g.mqttClient.Publish(ctx, topic, b, false, 0); err != nil {
+		slog.Error("mqtt publish failed", "topic", topic, "error", err)
+	}
+}
+
+func (g *Gardener) updateDisplay(text string) {
+	if g.display == nil {
+		return
+	}
+	// Best-effort; non-blocking.
+	select {
+	case g.display.In() <- display.OLEDCommand{Type: display.CmdClear}:
+	default:
+	}
+	select {
+	case g.display.In() <- display.OLEDCommand{Type: display.CmdText, X: 0, Y: 20, Text: text}:
+	default:
+	}
+	select {
+	case g.display.In() <- display.OLEDCommand{Type: display.CmdFlush}:
+	default:
+	}
 }

@@ -1,53 +1,45 @@
 {
     "station": "garden-station",
     "devices": {
-        "soil" {
-  	    "type": "vh400",
-            "pin": 0,
-            "timer": 1 
+        "soil": {
+            "type": "vh400",
+            "bus": "/dev/i2c-1",
+            "addr": "0x48",
+            "channel": 0,
+            "interval": 10
         },
-        "pump" {
-            "type", "gpio",
-            "direction", "output",
-            "pin": 1                
+        "pump": {
+            "type": "relay",
+            "chip": "gpiochip0",
+            "offset": 5
         },
-        "light" {
-            "type": "gpio",
-            "direction": "output",
-            "pin": 16
+        "light": {
+            "type": "relay",
+            "chip": "gpiochip0",
+            "offset": 16
         },
-        "button" {
-            "type": "gpio",
-            "pin": -1
+        "on": {
+            "type": "button",
+            "chip": "gpiochip0",
+            "offset": 17
         },
-        "temperature" {
+        "off": {
+            "type": "button",
+            "chip": "gpiochip0",
+            "offset": 27
+        },
+        "temperature": {
             "type": "bme280",
             "bus": "/dev/i2c-1",
-            "addr": 0x77,
-            "timer": 5
+            "addr": "0x76",
+            "interval": 10
         },
-        "display" {
+        "display": {
             "type": "oled",
-            "name": "display",
-            "bus": "/devi2c-1",
-            "addr": 0x3c,
+            "bus": "1",
+            "addr": "0x27",
             "height": 64,
             "width": 128
-        },
-        "red" {
-            "type": "gpio",
-            "direction": "output",
-            "pin": 25
-        },
-        "yellow" {
-            "type": "gpio",
-            "direction": "output",
-            "pin": 8
-        },
-        "green" {
-            "type": "gpio",
-            "direction": "output",
-            "pin": 7
         }
     }
 }

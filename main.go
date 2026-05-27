@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"log/slog"
@@ -8,46 +9,42 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/rustyeddy/devices"
-	"github.com/rustyeddy/otto/utils"
+	"github.com/rustyeddy/otto/logging"
+	mqttclient "github.com/rustyeddy/otto/messenger/mqtt"
 )
 
+// Config holds runtime configuration for the gardener.
 type Config struct {
-	StationName string
-	Mock        bool
-	Log         utils.LogConfig
-
-	Broker   string
-	Username string
-	Password string
+	StationName  string
+	Mock         bool
+	DryThreshold float64
+	WetThreshold float64
+	Log          logging.Config
+	Broker       string
+	Username     string
 }
 
-var (
-	config Config
-)
+var config Config
 
 func init() {
-	flag.BoolVar(&config.Mock, "mock", false, "mock gpio")
-	flag.StringVar(&config.Broker, "mqtt-broker", "otto", "MQTT broker address")
-	flag.StringVar(&config.Username, "mqtt-username", "", "MQTT broker address")
-	flag.StringVar(&config.Password, "mqtt-password", "", "MQTT broker address")
+	flag.BoolVar(&config.Mock, "mock", false, "mock GPIO and sensors (no hardware required)")
+	flag.StringVar(&config.Broker, "mqtt-broker", "otto", "MQTT broker hostname")
+	flag.StringVar(&config.Username, "mqtt-username", "", "MQTT username")
 	flag.StringVar(&config.StationName, "station-name", "gardener", "station name")
-
-	// Logging flags
+	flag.Float64Var(&config.DryThreshold, "dry-threshold", 20.0, "soil moisture dry threshold (%)")
+	flag.Float64Var(&config.WetThreshold, "wet-threshold", 60.0, "soil moisture wet threshold (%)")
 	flag.StringVar(&config.Log.Level, "log-level", "info", "log level: debug, info, warn, error")
-	flag.Var(&config.Log.Output, "log-output", "log output: stdout, stderr, file")
-	flag.Var(&config.Log.Format, "log-format", "log format: text, json")
+	flag.StringVar(&config.Log.Output, "log-output", "file", "log output: stdout, stderr, file")
+	flag.StringVar(&config.Log.Format, "log-format", "text", "log format: text, json")
 	flag.StringVar(&config.Log.FilePath, "log-file", "gardener.log", "log file path (when log-output=file)")
-	config.Log.Output.Set("file")
-	config.Log.Format.Set("text")
+	config.Log.Output = "file"
+	config.Log.Format = "text"
 }
 
 func main() {
 	flag.Parse()
 
-	// Initialize structured logging
-	_, err := utils.InitLogger(config.Log)
-	if err != nil {
+	if _, err := logging.NewService(config.Log); err != nil {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
 
@@ -56,27 +53,44 @@ func main() {
 		"mock", config.Mock,
 		"broker", config.Broker,
 		"log_level", config.Log.Level,
-		"log_output", config.Log.Output,
 	)
 
-	// Enable mocking in devices if mock flag is set
-	if config.Mock {
-		devices.SetMock(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// MQTT password from environment to avoid CLI process-list exposure.
+	password := os.Getenv("MQTT_PASSWORD")
+
+	var mqttPaho *mqttclient.Paho
+	if !config.Mock && config.Broker != "" && config.Broker != "none" {
+		mqttPaho = mqttclient.New(mqttclient.MQTTConfig{
+			Broker:   "tcp://" + config.Broker + ":1883",
+			Username: config.Username,
+			Password: password,
+		})
 	}
 
 	gardener := &Gardener{}
-	gardener.Init()
-	gardener.Start()
+	if err := gardener.Init(ctx, mqttPaho); err != nil {
+		log.Fatalf("gardener init failed: %v", err)
+	}
 
-	// Handle OS signals and call Stop() for graceful shutdown
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	done := make(chan struct{})
 	go func() {
-		sig := <-signals
-		slog.Info("received signal, stopping gardener", "signal", sig)
-		gardener.Stop()
+		defer close(done)
+		if err := gardener.Run(ctx); err != nil {
+			slog.Error("gardener stopped with error", "error", err)
+		}
 	}()
 
-	<-gardener.Done
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case sig := <-signals:
+		slog.Info("received signal, shutting down", "signal", sig)
+		cancel()
+		<-done
+	case <-done:
+	}
 	slog.Info("gardener stopped")
 }
